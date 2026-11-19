@@ -11,10 +11,12 @@ import hashlib
 import json
 import os
 import re
+import sys
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 
 from prediction import binding
+from transfer import evaluate, normalize_arm
 
 STATES = {"verified", "documented-only", "blocked", "impossible", "untested"}
 TAGS = ("MEASURED", "SOURCE", "INFERRED", "UNVERIFIED")
@@ -90,6 +92,7 @@ class Lint:
         self.root = root
         self.anchor = anchor
         self.findings: list[dict] = []
+        self.advisories: list[dict] = []
         self.runs: list[dict] = []
         self.predictions: dict[int, dict] = {}
         self.produced: dict[str, dict] = {}
@@ -97,6 +100,10 @@ class Lint:
 
     def flag(self, check: str, message: str, where: str = "") -> None:
         self.findings.append({"check": check, "message": message, "where": where})
+
+    def advisory(self, check: str, message: str, where: str = "") -> None:
+        """Readable limitation that does not fail the report by itself."""
+        self.advisories.append({"check": check, "message": message, "where": where})
 
     def objects(self, name: str, check: str):
         path = self.root / name
@@ -264,12 +271,19 @@ class Lint:
                 self.flag("L16", "missing transfer result or a specific Not run explanation")
             return
         try:
-            arms = json.loads(read(path))
+            payload = json.loads(read(path))
         except ValueError:
-            arms = None
-        if not isinstance(arms, list) or not arms:
-            self.flag("L16", "transfer result must be a nonempty list")
+            self.flag("L16", "transfer result is not valid JSON")
             return
+        if isinstance(payload, list):
+            self.legacy_transfer(payload)
+        elif isinstance(payload, dict):
+            self.computed_transfer(payload)
+        else:
+            self.flag("L16", "transfer result must be an object written by scripts/transfer.py")
+
+    def legacy_transfer(self, arms: list) -> None:
+        """Keep old labs readable; a list of declared verdicts cannot be recomputed."""
         seen = set()
         for index, arm in enumerate(arms, 1):
             where = f"transfer_result.json:{index}"
@@ -280,22 +294,130 @@ class Lint:
             kind = arm.get("kind") or (label.split("/")[0] if isinstance(label, str) else "")
             if kind not in ("positive", "negative"):
                 self.flag("L16", "each arm must specify positive or negative", where)
-            else:
-                seen.add(kind)
-            verdict = arm.get("pass")
-            if any(arm.get(key) is None for key in ("expected", "observed")) or type(verdict) is not bool:
-                self.flag("L16", "each arm needs an expected and an observed result and boolean pass", where)
-            if verdict is False:
-                if self.status == "mastered":
-                    self.flag("L3", "a failed transfer arm blocks mastery", where)
-                else:
-                    reason, ref = arm.get("reason"), arm.get("evidence")
-                    if not isinstance(reason, str) or not reason.strip() or not isinstance(ref, str) or not self.evidence(ref):
-                        self.flag("L16", "failed arms must cite a reason and existing local evidence", where)
+                continue
+            seen.add(kind)
+            if any(arm.get(key) is None for key in ("expected", "observed")) or type(arm.get("pass")) is not bool:
+                self.flag("L16", "legacy arms need expected, observed and a boolean pass", where)
+            elif arm["pass"] is False and self.status != "mastered":
+                reason, ref = arm.get("reason"), arm.get("evidence")
+                if not isinstance(reason, str) or not reason.strip() or not isinstance(ref, str) or not self.evidence(ref):
+                    self.flag("L16", "failed arms must cite a reason and existing local evidence", where)
         if seen != {"positive", "negative"}:
             self.flag("L16", "transfer needs positive and negative arms")
-        if self.status == "mastered" and not self.produced_path("transfer/transfer_result.json"):
-            self.flag("L13", "mastery requires transfer evidence from a successful recorded run")
+        self.advisory("L16", "legacy transfer result holds declared verdicts and no predeclared criterion, so "
+                             "pass/fail cannot be recomputed; re-verify with scripts/transfer.py plan and check")
+        if self.status == "mastered":
+            self.flag("L3", "Verified mastery needs the criterion-based transfer record; the legacy list cannot support it")
+
+    def computed_transfer(self, result: dict) -> None:
+        """Recompute both verdicts from the predeclared criteria and the observed values."""
+        arms = result.get("arms")
+        if result.get("schema") != 2 or not isinstance(arms, list) or not arms:
+            self.flag("L16", "new-format transfer result needs schema 2 and a nonempty arms list")
+            return
+        maker = next((run for run in reversed(self.runs)
+                      if "transfer/transfer_result.json" in run.get("changed", [])), None)
+        if maker is None or maker.get("exit") != 0:
+            self.flag("L13", "transfer result must be written by a successful recorded run")
+            return
+        criteria_path = self.evidence("transfer/criteria.json")
+        stated = result.get("criteria_sha")
+        if not criteria_path or not isinstance(stated, str) \
+                or hashlib.sha256(criteria_path.read_bytes()).hexdigest() != stated:
+            self.flag("L16", "result must point at the existing transfer/criteria.json it was computed from")
+            return
+        snapshot = maker.get("out") if isinstance(maker.get("out"), dict) else {}
+        meta = snapshot.get("transfer/criteria.json")
+        if not isinstance(meta, dict) or meta.get("sha") != stated:
+            self.flag("L16", "criteria must be present when the recorded transfer run starts")
+        elif "transfer/criteria.json" in maker.get("changed", []):
+            self.flag("L16", "criteria changed during the transfer run instead of being written before it")
+        try:
+            criteria = json.loads(read(criteria_path))
+        except ValueError:
+            criteria = None
+        planned: dict[str, dict] = {}
+        for number, arm in enumerate(criteria.get("arms", []) if isinstance(criteria, dict) else [], 1):
+            try:
+                entry = normalize_arm(arm, f"criteria.json arm {number}")
+            except ValueError as exc:
+                self.flag("L16", str(exc))
+                continue
+            planned[entry["kind"]] = entry
+        written = criteria.get("written_ns") if isinstance(criteria, dict) else None
+        started = maker.get("started_ns")
+        if type(written) is not int or type(started) is not int or written >= started:
+            self.flag("L16", "criteria were not written before the transfer run")
+        seen: set[str] = set()
+        failed: list[str] = []
+        for index, arm in enumerate(arms, 1):
+            where = f"transfer_result.json:arm {index}"
+            kind = arm.get("kind")
+            if not isinstance(arm, dict) or kind not in ("positive", "negative"):
+                self.flag("L16", "each arm needs a positive or negative kind", where)
+                continue
+            seen.add(kind)
+            planned_arm = planned.get(kind)
+            if planned_arm is None:
+                self.flag("L16", "this arm has no predeclared criterion", where)
+                continue
+            if any(arm.get(key) != planned_arm[key] for key in ("case", "expect", "criterion")):
+                self.flag("L16", "the arm differs from the predeclared case, expectation or criterion", where)
+                continue
+            observed = arm.get("observed")
+            if observed is None:
+                self.flag("L16", "the arm has no observed result", where)
+                continue
+            if self.produced_path(arm.get("evidence")) is None:
+                self.flag("L16", "the arm's evidence is missing or was not saved by a successful run", where)
+            met = evaluate(planned_arm["criterion"], observed)
+            expected_pass = met == (planned_arm["expect"] == "met")
+            if type(arm.get("pass")) is not bool:
+                self.flag("L16", "the arm needs a boolean pass computed by the checker", where)
+            elif arm["pass"] != expected_pass:
+                self.flag("L16", f"pass contradicts the recorded observation and criterion "
+                                 f"(computed {str(expected_pass).lower()})", where)
+            if arm.get("met") is not None and arm["met"] is not met:
+                self.flag("L16", "the recorded criterion outcome does not match the observation", where)
+            if not expected_pass:
+                failed.append(kind)
+                if self.status != "mastered":
+                    reason = arm.get("reason")
+                    if not isinstance(reason, str) or not reason.strip():
+                        self.flag("L16", "a failed arm needs a nonempty reason", where)
+        if seen != {"positive", "negative"}:
+            self.flag("L16", "transfer needs both a positive and a negative arm")
+        if self.status == "mastered":
+            if failed or seen != {"positive", "negative"}:
+                self.flag("L3", "Verified mastery needs both arms computed as passing")
+            elif self.produced_path("transfer/transfer_result.json") is None:
+                self.flag("L13", "mastery requires transfer evidence from a successful recorded run")
+        elif failed:
+            self.advisory("L16", "a transfer arm did not pass; the report stays Documented, not mastered")
+
+    def digest(self) -> None:
+        """A reusable hand-off summary must be structured and point at its evidence."""
+        path = self.root / "DIGEST.md"
+        if not path.exists():
+            return
+        if path.resolve() != path or not path.is_file():
+            self.flag("L19", "DIGEST.md must be a local regular file")
+            return
+        text = read(path)
+        headings = sections(text)
+        for key in ("practical rules", "pitfalls", "experiment conditions", "unverified"):
+            if not any(name.startswith(key) for name in headings):
+                self.flag("L19", f"DIGEST.md needs a '{key}' section")
+        refs = re.findall(r"`([^`\s]+)`", text) + re.findall(r"\]\(([^)\s]+)\)", text)
+        local = [ref.split("#")[0] for ref in refs
+                 if ref.split("#")[0] in ("COMPLETE.md", "FINDINGS.md") or ref.startswith(("out/", "transfer/"))]
+        if not local:
+            self.flag("L19", "DIGEST.md must link its rules to COMPLETE.md or the lab's evidence files")
+        for ref in local:
+            if ref == "COMPLETE.md":
+                continue
+            if self.evidence(ref) is None:
+                self.flag("L19", "DIGEST.md cites a missing local evidence path", ref)
 
     def secrets(self) -> None:
         files = [self.root / name for name in ("COMPLETE.md", "FINDINGS.md", "PREDICTIONS.md",
@@ -351,6 +473,7 @@ class Lint:
                 for row in rows(lines):
                     if not tagged(" ".join(row)):
                         self.flag("L17", "result row without an evidence tag")
+        self.digest()
         self.secrets()
         if log.is_file() and log.resolve() == log and len(read(log).splitlines()) < 15:
             self.flag("L10", "FINDINGS.md looks too short to be an audit trail")
@@ -368,13 +491,19 @@ def main() -> int:
     lint.run()
     if args.json:
         print(json.dumps(lint.findings, indent=2, ensure_ascii=True))
-    elif not lint.findings:
-        print("lint: clean (structure and provenance only)")
+        for item in lint.advisories:
+            print(f"advisory {item['check']}: {item['message']}", file=sys.stderr)
+        return int(bool(lint.findings))
+    for item in lint.findings:
+        where = f" ({item['where']})" if item["where"] else ""
+        print(f"{item['check']}: {item['message']}{where}")
+    for item in lint.advisories:
+        where = f" ({item['where']})" if item["where"] else ""
+        print(f"advisory {item['check']}: {item['message']}{where}", file=sys.stderr)
+    if lint.findings:
+        print(f"lint: {len(lint.findings)} finding(s), {len(lint.advisories)} advisory note(s)")
     else:
-        for item in lint.findings:
-            where = f" ({item['where']})" if item["where"] else ""
-            print(f"{item['check']}: {item['message']}{where}")
-        print(f"lint: {len(lint.findings)} finding(s)")
+        print(f"lint: clean (structure and provenance only), {len(lint.advisories)} advisory note(s)")
     return int(bool(lint.findings))
 
 

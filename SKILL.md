@@ -5,7 +5,7 @@ description: "Learn one topic through primary sources, bounded hands-on experime
 
 # Topic deep dive
 
-Turn a concrete question about `<topic>` into **tested behavior, reproducible scripts, and a self-contained `COMPLETE.md`**. Treat surprising failures as results, not as noise to hide. Write user-facing explanations, study notes, and reports in English. Keep the template's section keys and status values so the checks can read them. Preserve exact quotations, evidence literals, and identifiers when accuracy requires it.
+Turn a concrete question about `<topic>` into **tested behavior, reproducible scripts, and a self-contained `COMPLETE.md`**. Treat surprising failures as results, not as noise to hide. Write the explanation, study notes and report in the user's language, or in the language they ask for; keep the template's English section keys, status values, evidence tags and field names unchanged so the tools and the checks can read them.
 
 ## 1. Agree on what counts as done
 
@@ -47,27 +47,37 @@ python scripts/run_log.py -- python probe.py <case>
 
 ## 4. Transfer to something new
 
-Build a small new scenario or program in `transfer/`, distinct from exploration. Before running it, predict the new case's exact result using a separate oracle (known fixture rows/bytes, explicit expected state, or independent checker). Run the scenario through `run_log.py`. Test two arms:
+Build a small new scenario in `transfer/`, distinct from exploration, and judge it with a criterion that can be recomputed later. Test two arms with the **same** criterion:
 
-- **Positive:** the recommended method satisfies the new criterion.
-- **Negative:** the naive approach fails the same criterion, or a new boundary discriminates between the models. `pass: true` for this arm means the *expected failure/boundary* was seen.
+- **Positive:** the recommended method meets it; the arm predicts `met`.
+- **Negative:** the naive approach fails it; the arm predicts `unmet`. A negative arm that "passes" means the expected failure really happened, not that the naive method worked.
 
-Save the measured arms as `transfer/transfer_result.json`, a list of objects with `kind` (`positive` or `negative`), `expected`, `observed`, and a JSON boolean `pass`. A failed arm needs a nonempty `reason` and existing local `evidence` path. Preserve the original failure; if revised, try a **different** new case and record both in the reference. If a safe transfer cannot be run, say `Not run: <specific reason>` rather than inventing results.
+Record the plan **before** the run, because a criterion chosen after seeing results proves nothing:
+
+```text
+python scripts/transfer.py plan transfer/plan.json     # criteria stamped, before the probe
+python scripts/run_log.py -- python transfer/probe.py  # probe saves observations and the computed result
+```
+
+`transfer/plan.json` holds two arms, each with `kind`, `case`, `expect` (`met` or `unmet`) and a `criterion` of the form `{"op": ..., "value": ...}`. Supported ops are `equals`, `not_equals`, `contains` and `matches` (regular expression), which covers exact oracle rows, a required exit code, a substring, or a documented shape. The probe writes `transfer/observations.json` mapping each kind to `{"observed": ..., "evidence": "out/<file>"}`, then calls `transfer.py check` (or the same functions) to write `transfer/transfer_result.json`. That file carries the criteria hash and a computed `pass` per arm; never edit those verdicts by hand.
+
+The lint recomputes both verdicts from the stored criteria and the saved observation, and fails the report when a declared `pass` disagrees. A crashed probe, a missing evidence file, or an arm whose evidence was not saved by a successful recorded run is not a success. Preserve a failed arm together with a nonempty `reason`; if you revise the model, run a **different** new case and keep both records. If a safe transfer cannot be run, write `Not run: <specific reason>` instead of inventing results. Older labs whose `transfer_result.json` is still a plain list remain readable, but their declared verdicts cannot be recomputed; re-verify them with `transfer.py plan` and `check` before claiming mastery.
 
 ## 5. Deliver the knowledge and scripts
 
 - `COMPLETE.md`: status, actionable TL;DR, mental model, relevant operation/edge/error details, what's different from the docs or existing code, coverage, new-case result, prediction table, reproduction commands, open questions. Keep runnable scripts alongside the report with an evidence index. When the user wants the knowledge and scripts in one file, embed the complete shareable probe and transfer sources in an appendix as well. Links to docs are not a substitute for the actual procedure.
 - `FINDINGS.md`: dated audit trail of conditions, surprises and failed attempts, including cleanup. Include `out/`, `transfer/`, and both ledgers when sharing a clean lab; never include private state. Frame recommendations as inference, not proven changes to the user's project.
+- `DIGEST.md`: add it when the user asks to hand the knowledge to another AI or to pack it for reuse. Start from `templates/DIGEST_TEMPLATE.md` in the skill and keep four short sections: practical rules, pitfalls, experiment conditions, and what remains unverified. Every rule needs a link to its evidence in `COMPLETE.md`, `out/` or `transfer/`; a digest without those links is a summary of opinions, not of this study. Mention the digest in `COMPLETE.md` so a reader can find it.
 - Use `[SOURCE]` with a named/versioned primary source, `[INFERRED]` for deductions, or `[UNVERIFIED]` for gaps. For a measured fact use the strict form below, followed by the observation and the script/command. `expect` is a literal nonempty fragment **present** in the cited artifact (not necessarily your original prediction). Cite the original prediction separately. Cite a safe text evidence file written by a successful recorded probe; for binary evidence add an observed text summary with its hash/size.
 
   ```text
   [MEASURED n=1, conditions=<what you ran it on>, evidence=out/<file>, expect="<exact literal text>"]
   ```
 
-- Use **Verified mastery** only for the declared scope when every core row was verified and both required transfer arms passed. Otherwise use **Documented, not mastered**; if a budget/block prevented coverage, open with `Partial: items … are unverified` and say what would settle them. Documented-only work remains useful and is not a failed measurement.
+- Use **Verified mastery** only for the declared scope when every core row was verified and both transfer arms were recomputed as passing from recorded evidence. Otherwise use **Documented, not mastered**; if a budget/block prevented coverage, open with `Partial: items … are unverified` and say what would settle them. Documented-only work remains useful and is not a failed measurement.
 
 ## 6. Audit before handing it over
 
-1. Recheck claims against their source or measured artifact, and independently re-run a safe cited probe or checker. Verify the two transfer arms and tests for negative outcomes; confirm rollback or explicitly state what could not be restored.
-2. Run `python scripts/lint_knowledge.py .` and then `python scripts/manifest.py` on a new lab. Lint checks selected structural and provenance rules; it cannot validate the experiment design, enforce authorization or guarantee absence of private data. Manually review scripts, logs, and files before packaging; the manifest covers lab files, not external side effects.
-3. Present the reference and runnable artifacts. Report what was verified, under which conditions, what's still open, and how to repeat the most useful result. Leave unrelated project files alone.
+1. Recheck claims against their source or measured artifact, and independently re-run a safe cited probe or checker. Confirm that each transfer arm still satisfies the criterion stored in `transfer/criteria.json`; the lint recomputes it, but only you can judge whether the criterion is the right test. Confirm rollback or explicitly state what could not be restored.
+2. Run `python scripts/lint_knowledge.py .` and then `python scripts/manifest.py` on a new lab. Lint checks structure, provenance and the transfer arithmetic; it cannot validate the experiment design, prove the criterion is meaningful, enforce authorization or guarantee absence of private data. Manually review scripts, logs, and files before packaging; the manifest covers lab files, not external side effects.
+3. Present the reference and runnable artifacts, and the digest when one exists. Report what was verified, under which conditions, what's still open, and how to repeat the most useful result. Leave unrelated project files alone.

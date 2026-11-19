@@ -34,9 +34,9 @@
 
 ## 5. Transfer test
 
-Not run: <replace with the arms and predeclared criterion, or explain what blocked it.>
+Not run: <name both arms, the criterion stored in `transfer/criteria.json`, each arm's expected outcome, and what blocked the run.>
 
-<!-- Record the new case, expected and observed results, verdicts, and paths for both arms. -->
+<!-- Record the new case, the predeclared criterion and its expected verdict for each arm, the observed values, the computed pass from transfer/transfer_result.json and the evidence paths. Do not restate a pass the checker did not compute. -->
 
 ## 6. Prediction table
 
@@ -52,3 +52,7 @@ Not run: <replace with the P-ID rows once there is a recorded run.>
 ## 8. Open questions
 
 - [UNVERIFIED] <One important boundary, reason and a safe experiment that would settle it.>
+
+## 9. Hand-off digest
+
+Optional: when this study is handed to another AI or packaged for reuse, add `DIGEST.md` built from the skill's digest template, and link it here.

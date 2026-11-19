@@ -9,7 +9,7 @@ import shutil
 from pathlib import Path
 
 SKILL = Path(__file__).resolve().parents[1]
-HELPERS = ("prediction.py", "run_log.py", "lint_knowledge.py", "manifest.py")
+HELPERS = ("prediction.py", "run_log.py", "transfer.py", "lint_knowledge.py", "manifest.py")
 TEMPLATES = {
     "REFERENCE_TEMPLATE.md": "COMPLETE.md",
     "FINDINGS_TEMPLATE.md": "FINDINGS.md",
